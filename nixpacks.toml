@@ -1,17 +1,17 @@
 [phases.setup]
 nixPkgs = [
-    "php83",
-    "php83Packages.composer",
-    "php83Extensions.pdo_mysql",
-    "php83Extensions.mbstring",
-    "php83Extensions.xml",
-    "php83Extensions.curl",
-    "php83Extensions.openssl",
-    "php83Extensions.tokenizer",
-    "php83Extensions.dom",
-    "php83Extensions.fileinfo",
-    "php83Extensions.session",
-    "php83Extensions.ctype",
+    "php84",
+    "php84Packages.composer",
+    "php84Extensions.pdo_mysql",
+    "php84Extensions.mbstring",
+    "php84Extensions.xml",
+    "php84Extensions.curl",
+    "php84Extensions.openssl",
+    "php84Extensions.tokenizer",
+    "php84Extensions.dom",
+    "php84Extensions.fileinfo",
+    "php84Extensions.session",
+    "php84Extensions.ctype",
     "nodejs_22"
 ]
 
