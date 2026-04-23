@@ -1,0 +1,151 @@
+/**
+ * Library glass theme — dark shelf background + warm amber glass panels.
+ * Used by AuthenticatedLayout, GuestLayout, and standalone Login/Register.
+ */
+
+html {
+  color-scheme: dark;
+}
+
+.library-shell {
+  position: relative;
+  min-height: 100vh;
+  scrollbar-color: rgba(201, 168, 76, 0.55) rgba(0, 0, 0, 0.35);
+}
+
+.library-bg-fixed {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background-image: image-set(
+    url('/images/library.avif') type('image/avif'),
+    url('/images/library.webp') type('image/webp'),
+    url('/images/library.jpg') type('image/jpeg')
+  );
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+}
+
+.library-overlay-fixed {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: linear-gradient(rgba(10, 6, 3, 0.72), rgba(10, 6, 3, 0.72));
+}
+
+.library-content {
+  position: relative;
+  z-index: 2;
+}
+
+.library-glass-panel {
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(42, 28, 18, 0.48);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.38);
+}
+
+.library-field-select {
+  display: block;
+  width: 100%;
+  border-radius: 0.5rem;
+  border: 1px solid rgba(201, 168, 76, 0.28);
+  background-color: rgba(0, 0, 0, 0.25);
+  color: #f5f0e8;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  box-shadow: none;
+}
+
+.library-field-select:focus {
+  outline: none;
+  border-color: rgba(201, 168, 76, 0.55);
+  box-shadow: 0 0 0 2px rgba(201, 168, 76, 0.22);
+}
+
+/* Same surface as <select>; used by LibraryGlassSelect (ListboxButton). */
+button.library-field-select {
+  cursor: pointer;
+  text-align: left;
+}
+
+.library-table-wrap table {
+  border-collapse: collapse;
+}
+
+.library-table-wrap thead th {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.library-table-wrap tbody td {
+  color: #f5f0e8;
+}
+
+.library-table-wrap tbody tr {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.library-table-wrap tbody tr:hover td {
+  background-color: rgba(201, 168, 76, 0.06);
+}
+
+/* Large stat figures: Playfair + gold (class applied in JSX) */
+.library-stat-mega {
+  font-family: 'Playfair Display', Georgia, serif;
+  font-size: 2.8rem;
+  font-weight: 600;
+  line-height: 1.1;
+  color: #c9a84c;
+}
+
+/* Genre breakdown progress */
+.library-genre-bar-track {
+  width: 100%;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 9999px;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.library-genre-bar-fill {
+  height: 6px;
+  border-radius: 9999px;
+  background: linear-gradient(90deg, #8f6f2a, #c9a84c, #d4b76a);
+  box-shadow: 0 0 6px rgba(201, 168, 76, 0.4);
+}
+
+/* Nested mini-stat cards inside AI insights */
+.library-metric-nested {
+  border-radius: 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.library-shell *::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.library-shell *::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.library-shell *::-webkit-scrollbar-thumb {
+  background: rgba(201, 168, 76, 0.45);
+  border-radius: 9999px;
+  border: 2px solid rgba(0, 0, 0, 0.25);
+}
+
+.library-shell *::-webkit-scrollbar-thumb:hover {
+  background: rgba(201, 168, 76, 0.7);
+}
