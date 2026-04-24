@@ -21,16 +21,18 @@ RUN composer install --optimize-autoloader --no-scripts --no-interaction
 
 RUN npm ci && npm run build
 
-RUN mkdir -p storage/framework/{sessions,views,cache,testing} \
+RUN mkdir -p storage/framework/sessions storage/framework/views storage/framework/cache storage/framework/testing \
     storage/logs bootstrap/cache \
-    && chmod -R a+rw storage bootstrap/cache
+    && chown -R www-data:www-data storage bootstrap/cache \
+    && chmod -R 775 storage bootstrap/cache
 
 COPY docker/nginx.conf /etc/nginx/sites-available/default
 
 EXPOSE 8080
 
-CMD mkdir -p storage/framework/{sessions,views,cache,testing} storage/logs bootstrap/cache \
-    && chmod -R a+rw storage bootstrap/cache \
+CMD mkdir -p storage/framework/sessions storage/framework/views storage/framework/cache storage/framework/testing storage/logs bootstrap/cache \
+    && chown -R www-data:www-data storage bootstrap/cache \
+    && chmod -R 775 storage bootstrap/cache \
     && php artisan migrate --force \
     && php artisan db:seed --class=AdminSeeder --force \
     && php-fpm -D \
