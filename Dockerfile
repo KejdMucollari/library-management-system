@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y \
     git curl zip unzip libzip-dev \
     libpng-dev libonig-dev libxml2-dev \
     libcurl4-openssl-dev \
+    nginx \
     && docker-php-ext-install pdo_mysql mbstring xml curl zip \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -24,7 +25,13 @@ RUN mkdir -p storage/framework/{sessions,views,cache,testing} \
     storage/logs bootstrap/cache \
     && chmod -R a+rw storage bootstrap/cache
 
+COPY docker/nginx.conf /etc/nginx/sites-available/default
+
 EXPOSE 8080
 
-CMD php artisan migrate --force \
-    && php artisan serve --host=0.0.0.0 --port=${PORT:-8080}
+CMD mkdir -p storage/framework/{sessions,views,cache,testing} storage/logs bootstrap/cache \
+    && chmod -R a+rw storage bootstrap/cache \
+    && php artisan migrate --force \
+    && php artisan db:seed --class=AdminSeeder --force \
+    && php-fpm -D \
+    && nginx -g "daemon off;"
