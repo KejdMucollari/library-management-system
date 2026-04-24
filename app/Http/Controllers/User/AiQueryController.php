@@ -51,7 +51,7 @@ class AiQueryController extends Controller
                     ->with('ai.result', $spec);
             }
 
-            $result = $service->execute($spec, $user);
+            $result = $service->execute($spec, $user, $data['question']);
 
             $durationMs = (int) round((hrtime(true) - $started) / 1_000_000);
             $log->update([

@@ -26,8 +26,8 @@ class BookFactory extends Factory
             'author' => $this->faker->name(),
             'genre_id' => Genre::factory(),
             'status' => $this->faker->randomElement(BookStatus::values()),
-            'pages' => $this->faker->optional()->numberBetween(80, 900),
-            'price' => $this->faker->optional()->randomFloat(2, 5, 200),
+            'pages' => $this->faker->numberBetween(64, 800),
+            'price' => $this->faker->randomFloat(2, 4.99, 89.99),
         ];
     }
 }

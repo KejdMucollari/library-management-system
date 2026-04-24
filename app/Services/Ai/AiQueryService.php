@@ -2,9 +2,11 @@
 
 namespace App\Services\Ai;
 
+use App\Enums\BookStatus;
 use App\Models\Book;
 use App\Models\User;
 use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -56,11 +58,6 @@ class AiQueryService
      */
     public function translateToSpec(string $question, bool $isAdmin): array
     {
-        $apiKey = (string) config('services.openai.key', env('GROQ_API_KEY'));
-        if ($apiKey === '') {
-            throw new \RuntimeException('GROQ_API_KEY is not configured.');
-        }
-
         // This service is a query-to-spec translator/executor (tables/metrics/rankings), not a recommender.
         // Recommendation / suggestion prompts should not be forced into a DB query.
         $ql = strtolower($question);
@@ -80,11 +77,26 @@ class AiQueryService
             ];
         }
 
+        if (! $isAdmin && $this->nonAdminQuestionRequiresCrossUserBookContext($question)) {
+            return [
+                'summary' => 'I can only answer questions about your own books. I can\'t compare members or show who owns the most books across the whole library. Try asking "How many books do I have?" or "Show my completed books."',
+                'columns' => [],
+                'rows' => [],
+            ];
+        }
+
+        $apiKey = (string) config('services.openai.key', env('GROQ_API_KEY'));
+        if ($apiKey === '') {
+            throw new \RuntimeException('GROQ_API_KEY is not configured.');
+        }
+
         $systemLines = [
             'You translate questions into JSON query specs for a library app.',
             'Return ONLY valid JSON (no markdown).',
             'The database has tables: users and books.',
             'The books table has only these fields: id, title, author, genre, status, user_id, created_at, updated_at.',
+            'Book status filter values in the database are exactly these strings: plan_to_read, reading, completed, paused. Natural phrases like "plan to read", "want to read", or "TBR" must be mapped to plan_to_read in filters (field status, op =).',
+            'Genre filters use genres.name (e.g. "Sci-Fi"). Users may write "sci fi", "sci-fi", "scifi", or "science fiction" — use filter value "Sci-Fi" for that genre so it matches the database.',
             'The users table has only these fields: id, name, email, is_admin, created_at, updated_at.',
             'When the question asks for a person\'s name but the answer comes from book ownership, use from="books", select only ["user_id"] (never put "name" in select for books — that column is on users). The app will attach user_name from the users table automatically.',
         ];
@@ -130,7 +142,10 @@ class AiQueryService
             '- Prefer ranking/table for lists, metric for a single number.',
             '- For "most popular book", group by title and author, aggregate count(*), order desc.',
             '- For "who owns the most books", from="books", group_by user_id, aggregate count(*), order desc, limit 1, and include select ["user_id"].',
-            '- For "most expensive books", from="books", order_by price desc, limit 5.',
+            '- For "who owns the fewest books" / "least books" / "minimum books per user", from="books", group_by user_id, aggregate count(*), order asc, limit 1, and include select ["user_id"].',
+            '- For "most expensive" / "highest price" books: type "table" or "ranking", from="books", select title/author/price (and genre if needed), aggregates [], order_by price desc, limit N. Use limit 10 (or similar) when the user says plural "books"; use limit 1 only when they clearly mean a single book (singular "book"). Only count(*) may use field "*"; never max(*), min(*), sum(*), or avg(*).',
+            '- For "most pages" / "longest book": same pattern using order_by pages desc and explicit field pages (not max(*) mixed with other columns).',
+            '- For "latest / newest / most recently added book": use order_by created_at desc, limit 1, aggregates [] — never MAX(created_at) mixed with id/title in one SELECT without GROUP BY.',
             '- Filters must use columns that exist on the chosen table only: is_admin, name, and email are on users, not books. For book-count questions use from="books" and omit user-only filters unless from="users".',
             '- For created_at/updated_at you may use op =, >=, <=, <, > with string values. Use the calendar_day_start and calendar_day_end_exclusive lines from the user message for "today" windows (half-open interval: >= start AND < end).',
             '- For "created or edited today" on books: type "table", from "books", filters [], filter_or_groups with two groups: (created_at >= start AND created_at < end) OR (updated_at >= start AND updated_at < end), order_by updated_at desc, limit 100.',
@@ -219,7 +234,7 @@ class AiQueryService
 
         $spec = $this->normalizeAdminCatalogScope($spec, $question, $isAdmin);
 
-        return $this->validateAndNormalizeSpec($spec, $isAdmin);
+        return $this->validateAndNormalizeSpec($spec, $isAdmin, $question);
     }
 
     /**
@@ -324,6 +339,47 @@ class AiQueryService
         return $spec;
     }
 
+    /**
+     * Member-facing AI: questions that need the full member list / cross-user rankings.
+     */
+    private function nonAdminQuestionRequiresCrossUserBookContext(string $question): bool
+    {
+        $q = strtolower(trim($question));
+        if ($q === '') {
+            return false;
+        }
+
+        if (preg_match('/\b(all|every)\s+(users?|members?|people|readers?)\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\bfrom\s+all\s+users?\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\b(across|among)\s+(all\s+)?(the\s+)?(users?|members?|everyone|people|readers?)\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\bwho\s+owns\b/u', $q) && preg_match('/\b(most|more|fewest|least)\b/u', $q) && preg_match('/\bbooks?\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\bwhich\s+user\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\btop\s+reader\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\bwho\s+has\s+the\s+(most|fewest|least)\b/u', $q) && preg_match('/\bbooks?\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\b(user|member|reader)\s+with\s+the\s+(most|fewest|least)\s+books\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\b(most|fewest|least)\s+books\b/u', $q) && preg_match('/\b(in|across|throughout)\s+the\s+(library|system|app|database)\b/u', $q)) {
+            return true;
+        }
+
+        return false;
+    }
+
     private function questionImpliesPersonalBookScope(string $question): bool
     {
         $q = strtolower($question);
@@ -352,9 +408,123 @@ class AiQueryService
     }
 
     /**
-     * Execute a validated spec safely using Query Builder/Eloquent.
+     * True when the user clearly means one book ranked by price (singular "book"),
+     * not a list of top expensive books (plural "books").
      */
-    public function execute(array $spec, User $actor): AiQueryResult
+    private function questionAsksSingleTopBookByPrice(string $question): bool
+    {
+        $q = strtolower(trim($question));
+        if ($q === '') {
+            return false;
+        }
+
+        // Plural / list phrasing: keep the model's limit (e.g. top 10).
+        if (preg_match('/\b(most expensive|least expensive|cheapest|priciest|highest[- ]priced|lowest[- ]priced)\s+books\b/u', $q)) {
+            return false;
+        }
+        if (preg_match('/\bexpensive\s+books\b/u', $q)) {
+            return false;
+        }
+
+        if (preg_match('/\b(which|what)\s+(is|was)\s+the\s+most\s+expensive\s+book\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\b(which|what)\s+(is|was)\s+the\s+(cheapest|least\s+expensive)\s+book\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\b(most expensive|priciest|highest[- ]price|costliest)\s+book\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\b(least expensive|cheapest|lowest[- ]price)\s+book\b/u', $q)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Singular "book with the most pages" / "longest book" → limit 1 when sorted by pages.
+     */
+    private function questionAsksSingleTopBookByPages(string $question): bool
+    {
+        $q = strtolower(trim($question));
+        if ($q === '') {
+            return false;
+        }
+
+        if (preg_match('/\bbooks?\s+with\s+the\s+(most|fewest|least)\s+pages\b/u', $q)) {
+            return false;
+        }
+
+        if (preg_match('/\b(which|what)\s+is\s+the\s+book\s+with\s+the\s+most\s+pages\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\b(which|what)\s+book\s+(has|had)\s+the\s+most\s+pages\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\bbook\s+with\s+the\s+most\s+pages\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\b(most|fewest|least)\s+pages\b/u', $q) && preg_match('/\bbook\b/u', $q) && ! preg_match('/\bbooks\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\blongest\s+book\b/u', $q)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * When the model uses max(*)/min(*) on books, pick a real column (only COUNT(*) is valid with *).
+     */
+    private function inferScalarAggregateFieldFromQuestion(?string $question): string
+    {
+        $q = strtolower(trim((string) $question));
+        if ($q !== '' && preg_match('/\b(page|pages|longest|shortest|length)\b/u', $q)) {
+            return 'pages';
+        }
+        if ($q !== '' && preg_match('/\b(latest|newest|most\s+recent|recently\s+added|last\s+added)\b/u', $q) && preg_match('/\bbook\b/u', $q)) {
+            return 'created_at';
+        }
+        if ($q !== '' && preg_match('/\b(last|latest)\s+(edit|update|modified)\b/u', $q)) {
+            return 'updated_at';
+        }
+        if ($q !== '' && preg_match('/\b(price|expensive|cheap|cost|priced)\b/u', $q)) {
+            return 'price';
+        }
+
+        return 'price';
+    }
+
+    /**
+     * Singular "latest added book" → limit 1 when sorted by created_at.
+     */
+    private function questionAsksSingleLatestBookByCreatedAt(string $question): bool
+    {
+        $q = strtolower(trim($question));
+        if ($q === '') {
+            return false;
+        }
+        if (preg_match('/\b(which|what)\s+is\s+the\s+latest\b/u', $q) && preg_match('/\bbook\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\b(latest|newest|most\s+recently)\s+added\s+book\b/u', $q)) {
+            return true;
+        }
+        if (preg_match('/\bbook\b/u', $q) && preg_match('/\b(latest|newest)\s+(added|created)\b/u', $q)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Execute a validated spec safely using Query Builder/Eloquent.
+     *
+     * @param  string|null  $question  Original NL question (used to force limit=1 for singular "most expensive book").
+     */
+    public function execute(array $spec, User $actor, ?string $question = null): AiQueryResult
     {
         // Safety net: non-admin users are always scoped to their own books, and may not query users.
         if (!$actor->isAdmin()) {
@@ -367,9 +537,17 @@ class AiQueryService
                     debug: ['spec' => $spec],
                 );
             }
+            if (($spec['from'] ?? null) === 'books' && in_array('user_id', $spec['group_by'] ?? [], true)) {
+                return new AiQueryResult(
+                    columns: [],
+                    rows: [],
+                    summary: 'I can only answer questions about your own books. I can\'t rank or compare other readers. Try asking "How many books do I have?" or "Show my completed books."',
+                    debug: ['spec' => $spec],
+                );
+            }
         }
 
-        $spec = $this->validateAndNormalizeSpec($spec, $actor->isAdmin());
+        $spec = $this->validateAndNormalizeSpec($spec, $actor->isAdmin(), $question);
 
         // The model may put user columns (e.g. "name") on a books query — books only has user_id.
         if (($spec['from'] ?? '') === 'books') {
@@ -544,29 +722,39 @@ class AiQueryService
 
         $aggAliases = [];
         foreach ($spec['aggregates'] as $agg) {
-            $fn = $agg['fn'];
-            $field = $agg['field'];
-            $as = $agg['as'];
+            $fn = strtolower((string) ($agg['fn'] ?? ''));
+            $field = (string) ($agg['field'] ?? '');
+            $as = (string) ($agg['as'] ?? '');
 
-            if (!in_array($fn, self::ALLOWED_AGG, true)) {
+            if (! in_array($fn, self::ALLOWED_AGG, true)) {
                 throw new \RuntimeException("Aggregate not allowed: {$fn}");
             }
 
-            if ($field !== '*' && !in_array($field, $allowedFields, true)) {
+            if ($field !== '*' && ! in_array($field, $allowedFields, true)) {
                 throw new \RuntimeException("Aggregate field not allowed: {$field}");
             }
 
-            if (!is_string($as) || $as === '') {
+            if ($field === '*' && $fn !== 'count') {
+                throw new \RuntimeException("Invalid aggregate {$fn}(*): only count(*) may use *.");
+            }
+
+            if ($as === '') {
                 throw new \RuntimeException('Aggregate alias required.');
             }
 
             $aggAliases[] = $as;
-            $aggField = $field;
-            if ($field !== '*' && $from === 'books' && $usesGenreName) {
-                $aggField = $field === 'genre' ? $genreCol() : $bookCol($field);
+
+            if ($fn === 'count' && $field === '*') {
+                $select[] = 'COUNT(*) as '.$as;
+            } else {
+                $aggFieldSql = $field;
+                if ($from === 'books') {
+                    $aggFieldSql = ($usesGenreName && $field === 'genre')
+                        ? $genreCol()
+                        : $bookCol($field);
+                }
+                $select[] = strtoupper($fn)."({$aggFieldSql}) as {$as}";
             }
-            $expr = $field === '*' ? "{$fn}(*)" : "{$fn}({$aggField})";
-            $select[] = "{$expr} as {$as}";
         }
 
         if (count($select) === 0) {
@@ -661,6 +849,57 @@ class AiQueryService
             }
         }
 
+        if (($spec['from'] ?? '') === 'books' && count($rows) === 1) {
+            $first = $rows[0];
+            $ob = $spec['order_by'] ?? [];
+            $o0 = $ob[0] ?? null;
+            if (is_array($first) && is_array($o0) && ($o0['field'] ?? '') === 'price') {
+                $title = $first['title'] ?? null;
+                $price = $first['price'] ?? null;
+                if (is_string($title) && $title !== '' && $price !== null && $price !== '') {
+                    $dir = strtolower((string) ($o0['dir'] ?? 'desc'));
+                    $phrase = $dir === 'asc' ? 'least expensive' : 'most expensive';
+                    $priceNum = is_numeric($price) ? (float) $price : null;
+                    $priceOut = $priceNum !== null ? '$'.number_format($priceNum, 2) : (string) $price;
+
+                    return "The {$phrase} book is {$title} ({$priceOut}).";
+                }
+            }
+            if (is_array($first) && is_array($o0) && ($o0['field'] ?? '') === 'pages') {
+                $title = $first['title'] ?? null;
+                $pages = $first['pages'] ?? null;
+                if (is_string($title) && $title !== '' && $pages !== null && $pages !== '') {
+                    $dir = strtolower((string) ($o0['dir'] ?? 'desc'));
+                    $phrase = $dir === 'asc' ? 'fewest pages' : 'most pages';
+                    $pagesOut = is_numeric($pages) ? (string) (int) $pages : (string) $pages;
+
+                    return "The book with the {$phrase} is {$title} ({$pagesOut} pages).";
+                }
+            }
+            $tsField = is_array($o0) ? (string) ($o0['field'] ?? '') : '';
+            if (is_array($first) && is_array($o0) && in_array($tsField, ['created_at', 'updated_at'], true)) {
+                $title = $first['title'] ?? null;
+                $ts = $first[$tsField] ?? null;
+                if (is_string($title) && $title !== '' && $ts !== null && $ts !== '') {
+                    $dir = strtolower((string) ($o0['dir'] ?? 'desc'));
+                    if ($tsField === 'updated_at') {
+                        $phrase = $dir === 'asc' ? 'least recently updated' : 'last updated';
+                    } else {
+                        $phrase = $dir === 'asc' ? 'earliest added' : 'latest added';
+                    }
+                    try {
+                        $out = Carbon::parse((string) $ts)
+                            ->timezone((string) config('app.timezone'))
+                            ->format('M j, Y g:i A');
+                    } catch (\Throwable) {
+                        $out = (string) $ts;
+                    }
+
+                    return "The {$phrase} book is {$title} ({$out}).";
+                }
+            }
+        }
+
         if ($spec['type'] === 'ranking' && count($rows) === 1) {
             $first = $rows[0];
             if (is_array($first) && isset($first['user_name'], $first['user_id'])) {
@@ -727,7 +966,7 @@ class AiQueryService
      * @param  array<string, mixed>  $spec
      * @return array<string, mixed>
      */
-    private function validateAndNormalizeSpec(array $spec, bool $isAdmin): array
+    private function validateAndNormalizeSpec(array $spec, bool $isAdmin, ?string $question = null): array
     {
         $type = $spec['type'] ?? null;
         $scope = $spec['scope'] ?? null;
@@ -783,13 +1022,22 @@ class AiQueryService
 
         $aggregatesNorm = [];
         foreach ($aggregates as $a) {
-            if (!is_array($a)) {
+            if (! is_array($a)) {
                 continue;
             }
             $fn = $a['fn'] ?? null;
             $field = $a['field'] ?? null;
             $as = $a['as'] ?? null;
-            if (!is_string($fn) || !is_string($field) || !is_string($as)) {
+            if (! is_string($fn) || ! is_string($field) || ! is_string($as)) {
+                continue;
+            }
+            $fn = strtolower($fn);
+            if ($field === '*' && $fn === 'count') {
+                // keep *
+            } elseif ($field === '*' && $from === 'books' && in_array($fn, ['sum', 'avg', 'min', 'max'], true)) {
+                // Groq may emit max(*) — only COUNT(*) is valid; infer column from the question when possible.
+                $field = $this->inferScalarAggregateFieldFromQuestion($question);
+            } elseif ($field === '*' && $fn !== 'count') {
                 continue;
             }
             $aggregatesNorm[] = [
@@ -801,12 +1049,12 @@ class AiQueryService
 
         $orderNorm = [];
         foreach ($orderBy as $o) {
-            if (!is_array($o)) {
+            if (! is_array($o)) {
                 continue;
             }
             $field = $o['field'] ?? null;
             $dir = $o['dir'] ?? null;
-            if (!is_string($field) || !is_string($dir)) {
+            if (! is_string($field) || ! is_string($dir)) {
                 continue;
             }
             $orderNorm[] = [
@@ -815,10 +1063,77 @@ class AiQueryService
             ];
         }
 
+        // Mixing row columns with MAX/MIN(scalar) and no GROUP BY breaks MySQL ONLY_FULL_GROUP_BY.
+        // Rewrite to ORDER BY that column + drop the aggregate (same top row as MAX/MIN would pick).
+        $scalarMaxMin = ['price', 'pages', 'created_at', 'updated_at'];
+        if ($from === 'books' && $groupBy === [] && count($aggregatesNorm) === 1 && $select !== []) {
+            $a0 = $aggregatesNorm[0];
+            $fn0 = $a0['fn'];
+            $f0 = $a0['field'];
+            if (in_array($fn0, ['max', 'min'], true) && in_array($f0, $scalarMaxMin, true)) {
+                $scalar = $f0;
+                $dir = $fn0 === 'max' ? 'desc' : 'asc';
+                $alias = $a0['as'];
+                $aggregatesNorm = [];
+                $mapped = false;
+                $newOrder = [];
+                foreach ($orderNorm as $o) {
+                    if (($o['field'] ?? '') === $alias) {
+                        $newOrder[] = ['field' => $scalar, 'dir' => $dir];
+                        $mapped = true;
+                    } else {
+                        $newOrder[] = $o;
+                    }
+                }
+                $orderNorm = $mapped ? $newOrder : array_merge([['field' => $scalar, 'dir' => $dir]], $orderNorm);
+                if (! in_array($scalar, $select, true)) {
+                    $select[] = $scalar;
+                }
+                $select = ['title', $scalar];
+            }
+        }
+
+        // Singular "most expensive book" / "book with the most pages" → one row; plural lists keep model limit.
+        if ($from === 'books' && $question !== null && $question !== '' && $groupBy === [] && $aggregatesNorm === []) {
+            $o0 = $orderNorm[0] ?? null;
+            if (is_array($o0) && ($o0['field'] ?? '') === 'price' && $this->questionAsksSingleTopBookByPrice($question)) {
+                $limit = 1;
+            }
+            if (is_array($o0) && ($o0['field'] ?? '') === 'pages' && $this->questionAsksSingleTopBookByPages($question)) {
+                $limit = 1;
+            }
+            if (is_array($o0) && ($o0['field'] ?? '') === 'created_at' && $this->questionAsksSingleLatestBookByCreatedAt($question)) {
+                $limit = 1;
+            }
+        }
+
+        // Tidy columns when returning a single row sorted by price, pages, or timestamps.
+        if ($from === 'books' && $groupBy === [] && $aggregatesNorm === [] && ($limit === 1)) {
+            $o0 = $orderNorm[0] ?? null;
+            if (is_array($o0) && ($o0['field'] ?? '') === 'price' && count($select) > 2) {
+                $select = ['title', 'price'];
+            }
+            if (is_array($o0) && ($o0['field'] ?? '') === 'pages' && count($select) > 2) {
+                $select = ['title', 'pages'];
+            }
+            if (is_array($o0) && ($o0['field'] ?? '') === 'created_at' && count($select) > 2) {
+                $select = ['title', 'created_at'];
+            }
+            if (is_array($o0) && ($o0['field'] ?? '') === 'updated_at' && count($select) > 2) {
+                $select = ['title', 'updated_at'];
+            }
+        }
+
         $filtersNorm = [];
         foreach ($filters as $f) {
             $n = $this->normalizeFilterEntry($f);
             if ($n !== null) {
+                if ($from === 'books' && ($n['field'] ?? '') === 'status' && is_string($n['value'])) {
+                    $n['value'] = $this->normalizeBookStatusFilterValue($n['value']);
+                }
+                if ($from === 'books' && ($n['field'] ?? '') === 'genre' && is_string($n['value'])) {
+                    $n['value'] = $this->normalizeGenreFilterValue($n['value']);
+                }
                 $filtersNorm[] = $n;
             }
         }
@@ -838,6 +1153,12 @@ class AiQueryService
                 }
                 $n = $this->normalizeFilterEntry($f);
                 if ($n !== null) {
+                    if ($from === 'books' && ($n['field'] ?? '') === 'status' && is_string($n['value'])) {
+                        $n['value'] = $this->normalizeBookStatusFilterValue($n['value']);
+                    }
+                    if ($from === 'books' && ($n['field'] ?? '') === 'genre' && is_string($n['value'])) {
+                        $n['value'] = $this->normalizeGenreFilterValue($n['value']);
+                    }
                     $inner[] = $n;
                 }
             }
@@ -897,6 +1218,70 @@ class AiQueryService
             'op' => $op,
             'value' => $value,
         ];
+    }
+
+    /**
+     * Map NL / spaced status labels to the exact DB enum strings so filters match MySQL rows.
+     */
+    private function normalizeBookStatusFilterValue(string $value): string
+    {
+        $trim = trim($value);
+        $lower = strtolower($trim);
+
+        if (in_array($lower, BookStatus::values(), true)) {
+            return $lower;
+        }
+
+        $snake = strtolower(preg_replace('/[\s\-]+/', '_', $trim));
+        $snake = preg_replace('/_+/', '_', $snake);
+        if (in_array($snake, BookStatus::values(), true)) {
+            return $snake;
+        }
+
+        if (preg_match('/^tbr$/i', $trim)) {
+            return BookStatus::PlanToRead->value;
+        }
+        if (preg_match('/want\s+to\s+read|plan(?:ned)?\s+to\s+read/i', $trim)) {
+            return BookStatus::PlanToRead->value;
+        }
+        if (preg_match('/\bplan\s+to\s+read\b/i', $trim)) {
+            return BookStatus::PlanToRead->value;
+        }
+        if ($snake === 'want_to_read' || $snake === 'to_read') {
+            return BookStatus::PlanToRead->value;
+        }
+
+        if (preg_match('/\bcompleted\b|\bfinished\b|\bdone\b/i', $trim)) {
+            return BookStatus::Completed->value;
+        }
+        if (preg_match('/\bpaused\b|\bon\s+hold\b/i', $trim)) {
+            return BookStatus::Paused->value;
+        }
+        if (preg_match('/\breading\b/i', $trim) && ! preg_match('/plan|want|tbr/i', $trim)) {
+            return BookStatus::Reading->value;
+        }
+
+        return $lower;
+    }
+
+    /**
+     * Map common spellings to the canonical genres.name stored in the DB (seeders use "Sci-Fi", etc.).
+     */
+    private function normalizeGenreFilterValue(string $value): string
+    {
+        $trim = trim($value);
+        if ($trim === '') {
+            return $value;
+        }
+
+        $fold = strtolower(preg_replace('/[\s\-_\.]+/u', '', $trim));
+
+        // sci fi, sci-fi, sci_fi, scifi, sci.fi, SCIFI, science fiction, sciencefiction
+        if ($fold === 'scifi' || $fold === 'scify' || $fold === 'sciencefiction') {
+            return 'Sci-Fi';
+        }
+
+        return $trim;
     }
 }
 

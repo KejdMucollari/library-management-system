@@ -110,5 +110,21 @@ class AiQueryTest extends TestCase
             $this->assertSame($user->id, (int) $row['user_id']);
         }
     }
+
+    public function test_user_ai_rejects_cross_member_reader_questions_without_groq(): void
+    {
+        config()->set('services.openai.key', 'test');
+        $user = User::factory()->create(['is_admin' => false]);
+
+        $resp = $this->actingAs($user)->post('/ai', [
+            'question' => 'Who owns the most books from all users?',
+        ]);
+
+        $resp->assertRedirect('/books');
+        $result = session('ai.result');
+        $this->assertIsArray($result);
+        $this->assertSame([], $result['rows']);
+        $this->assertStringContainsString('own books', strtolower($result['summary'] ?? ''));
+    }
 }
 

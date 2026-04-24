@@ -91,6 +91,7 @@ export default function BooksIndex({
         { label: 'Reading', value: 'reading' },
         { label: 'Completed', value: 'completed' },
         { label: 'Paused', value: 'paused' },
+        { label: 'Plan to read', value: 'plan_to_read' },
     ];
 
     const genreFilterOptions = [

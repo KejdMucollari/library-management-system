@@ -35,12 +35,22 @@ class DatabaseSeeder extends Seeder
 
         $users = User::factory(4)->create();
 
-        // Seed 100 books across these users (including admin).
-        $owners = $users->push($admin);
+        // Four regular users, then admin — same order as $owners below.
+        $owners = $users->push($admin)->values();
 
-        Book::factory(100)->make()->each(function (Book $book) use ($owners) {
-            $book->user_id = $owners->random()->id;
-            $book->save();
-        });
+        $genreIds = Genre::query()->pluck('id');
+
+        // Uneven split (100 total) so admin AI can rank "most books" vs "fewest books" per user.
+        $booksPerOwner = [42, 28, 15, 8, 7];
+
+        foreach ($owners as $index => $owner) {
+            $count = $booksPerOwner[$index] ?? 0;
+            for ($i = 0; $i < $count; $i++) {
+                Book::factory()->create([
+                    'user_id' => $owner->id,
+                    'genre_id' => $genreIds->random(),
+                ]);
+            }
+        }
     }
 }
