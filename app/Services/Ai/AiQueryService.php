@@ -4,6 +4,7 @@ namespace App\Services\Ai;
 
 use App\Enums\BookStatus;
 use App\Models\Book;
+use App\Models\Genre;
 use App\Models\User;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Carbon;
@@ -51,6 +52,14 @@ class AiQueryService
         'updated_at',
     ];
 
+    private const GENRE_FIELDS = [
+        'id',
+        'name',
+        'slug',
+        'created_at',
+        'updated_at',
+    ];
+
     /**
      * Translate a natural language question into a strict JSON spec.
      *
@@ -93,11 +102,12 @@ class AiQueryService
         $systemLines = [
             'You translate questions into JSON query specs for a library app.',
             'Return ONLY valid JSON (no markdown).',
-            'The database has tables: users and books.',
+            'The database has tables: users, books, genres.',
             'The books table has only these fields: id, title, author, genre, status, user_id, created_at, updated_at.',
             'Book status filter values in the database are exactly these strings: plan_to_read, reading, completed, paused. Natural phrases like "plan to read", "want to read", or "TBR" must be mapped to plan_to_read in filters (field status, op =).',
             'Genre filters use genres.name (e.g. "Sci-Fi"). Users may write "sci fi", "sci-fi", "scifi", or "science fiction" — use filter value "Sci-Fi" for that genre so it matches the database.',
             'The users table has only these fields: id, name, email, is_admin, created_at, updated_at.',
+            'The genres table has only these fields: id, name, slug, created_at, updated_at.',
             'When the question asks for a person\'s name but the answer comes from book ownership, use from="books", select only ["user_id"] (never put "name" in select for books — that column is on users). The app will attach user_name from the users table automatically.',
         ];
 
@@ -123,7 +133,7 @@ class AiQueryService
             '{',
             '  "type": "metric" | "table" | "ranking",',
             '  "scope": "me" | "all",',
-            '  "from": "books" | "users",',
+            '  "from": "books" | "users" | "genres",',
             '  "select": ["field", ...],',
             '  "aggregates": [{"fn":"count|sum|avg|min|max","field":"field|*","as":"alias"}],',
             '  "group_by": ["field", ...],',
@@ -549,6 +559,24 @@ class AiQueryService
 
         $spec = $this->validateAndNormalizeSpec($spec, $actor->isAdmin(), $question);
 
+        // Completion rate needs two counts (completed / total); handle it directly.
+        if (($spec['from'] ?? null) === 'books' && $question !== null && preg_match('/\bcompletion\s+rate\b/u', strtolower($question))) {
+            $base = Book::query();
+            if (! $actor->isAdmin()) {
+                $base->where('user_id', $actor->id);
+            }
+            $total = (clone $base)->count();
+            $completed = (clone $base)->where('status', BookStatus::Completed->value)->count();
+            $rate = $total > 0 ? round(($completed / $total) * 100, 1) : 0.0;
+
+            return new AiQueryResult(
+                columns: [],
+                rows: [],
+                summary: "Completion rate: {$rate}% ({$completed}/{$total}).",
+                debug: ['spec' => $spec],
+            );
+        }
+
         // Admin can ask questions about books by specifying the owner's name/email.
         // Groq sometimes incorrectly places a user name into the user_id filter; normalize that to a real id.
         if ($actor->isAdmin() && ($spec['from'] ?? null) === 'books') {
@@ -585,7 +613,7 @@ class AiQueryService
 
             $allowedFields = self::BOOK_FIELDS;
             $qb->from('books');
-        } else {
+        } elseif ($from === 'users') {
             $qb = User::query()->toBase();
             $allowedFields = self::USER_FIELDS;
             $qb->from('users');
@@ -594,6 +622,10 @@ class AiQueryService
             if (!$actor->isAdmin()) {
                 throw new \RuntimeException('Not authorized.');
             }
+        } else {
+            $qb = Genre::query()->toBase();
+            $allowedFields = self::GENRE_FIELDS;
+            $qb->from('genres');
         }
 
         // "genre" in the UI is genres.name (books.genre_id), not the legacy books.genre text column.
@@ -994,7 +1026,7 @@ class AiQueryService
             $scope = 'me';
         }
 
-        if (!in_array($from, ['books', 'users'], true)) {
+        if (!in_array($from, ['books', 'users', 'genres'], true)) {
             throw new \RuntimeException('Invalid spec.from');
         }
 
@@ -1059,6 +1091,20 @@ class AiQueryService
 
         // MySQL ONLY_FULL_GROUP_BY: if we have aggregates and no GROUP BY, the SELECT list must be only aggregates.
         if ($from === 'users' && $groupBy === [] && $aggregatesNorm !== [] && $type !== 'table') {
+            $select = [];
+        }
+
+        // MySQL ONLY_FULL_GROUP_BY: aggregates without GROUP BY can't select raw columns.
+        // Exception: we deliberately "collapse" scalar MAX/MIN queries (price/pages/created_at/updated_at)
+        // into an ORDER BY query later, which needs select fields present to keep the row shape.
+        $isCollapsibleScalarMaxMin =
+            $from === 'books'
+            && $groupBy === []
+            && count($aggregatesNorm) === 1
+            && in_array($aggregatesNorm[0]['fn'] ?? null, ['max', 'min'], true)
+            && in_array($aggregatesNorm[0]['field'] ?? null, ['price', 'pages', 'created_at', 'updated_at'], true);
+
+        if ($groupBy === [] && $aggregatesNorm !== [] && ! $isCollapsibleScalarMaxMin) {
             $select = [];
         }
 

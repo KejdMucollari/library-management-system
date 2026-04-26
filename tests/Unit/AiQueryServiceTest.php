@@ -315,5 +315,55 @@ class AiQueryServiceTest extends TestCase
         $this->assertSame([], $result['rows']);
         $this->assertStringContainsString('own books', strtolower($result['summary']));
     }
+
+    public function test_aggregates_without_group_by_drop_select_to_avoid_only_full_group_by(): void
+    {
+        $user = User::factory()->create(['is_admin' => false]);
+        Book::factory()->for($user)->count(3)->create(['status' => BookStatus::Reading]);
+
+        $service = app(AiQueryService::class);
+        $spec = [
+            'type' => 'metric',
+            'scope' => 'me',
+            'from' => 'books',
+            'select' => ['id', 'title', 'status'],
+            'aggregates' => [['fn' => 'count', 'field' => '*', 'as' => 'count']],
+            'group_by' => [],
+            'order_by' => [],
+            'limit' => 25,
+            'filters' => [
+                ['field' => 'status', 'op' => '=', 'value' => 'reading'],
+            ],
+        ];
+
+        $result = $service->execute($spec, $user, 'how many books am i reading')->toArray();
+
+        $this->assertSame('Result: 3', $result['summary']);
+    }
+
+    public function test_completion_rate_returns_summary_without_sql_error(): void
+    {
+        $user = User::factory()->create(['is_admin' => false]);
+        Book::factory()->for($user)->count(4)->create(['status' => BookStatus::Completed]);
+        Book::factory()->for($user)->count(6)->create(['status' => BookStatus::Reading]);
+
+        $service = app(AiQueryService::class);
+        $spec = [
+            'type' => 'metric',
+            'scope' => 'me',
+            'from' => 'books',
+            'select' => [],
+            'aggregates' => [],
+            'group_by' => [],
+            'order_by' => [],
+            'limit' => 25,
+            'filters' => [],
+        ];
+
+        $result = $service->execute($spec, $user, 'what is the completion rate')->toArray();
+
+        $this->assertStringContainsString('completion rate', strtolower($result['summary'] ?? ''));
+        $this->assertStringContainsString('4/10', (string) ($result['summary'] ?? ''));
+    }
 }
 
