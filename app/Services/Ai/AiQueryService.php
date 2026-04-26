@@ -549,6 +549,16 @@ class AiQueryService
 
         $spec = $this->validateAndNormalizeSpec($spec, $actor->isAdmin(), $question);
 
+        // Admin can ask questions about books by specifying the owner's name/email.
+        // Groq sometimes incorrectly places a user name into the user_id filter; normalize that to a real id.
+        if ($actor->isAdmin() && ($spec['from'] ?? null) === 'books') {
+            $specOrEarly = $this->resolveBookOwnerFiltersForAdmin($spec);
+            if ($specOrEarly instanceof AiQueryResult) {
+                return $specOrEarly;
+            }
+            $spec = $specOrEarly;
+        }
+
         // The model may put user columns (e.g. "name") on a books query — books only has user_id.
         if (($spec['from'] ?? '') === 'books') {
             $spec['select'] = array_values(array_filter(
@@ -1047,6 +1057,11 @@ class AiQueryService
             ];
         }
 
+        // MySQL ONLY_FULL_GROUP_BY: if we have aggregates and no GROUP BY, the SELECT list must be only aggregates.
+        if ($from === 'users' && $groupBy === [] && $aggregatesNorm !== [] && $type !== 'table') {
+            $select = [];
+        }
+
         $orderNorm = [];
         foreach ($orderBy as $o) {
             if (! is_array($o)) {
@@ -1179,6 +1194,83 @@ class AiQueryService
             'filters' => $filtersNorm,
             'filter_or_groups' => $orGroupsNorm,
         ];
+    }
+
+    /**
+     * Admin-only: normalize books owner filters that use user name/email.
+     *
+     * Supports:
+     * - user_id = "Billie Lindgren" (model bug)
+     * - user_name = "Billie Lindgren" (virtual)
+     * - owner = "billie@domain.com" (virtual)
+     *
+     * @param  array<string, mixed>  $spec
+     * @return array<string, mixed>|AiQueryResult
+     */
+    private function resolveBookOwnerFiltersForAdmin(array $spec): array|AiQueryResult
+    {
+        $filters = $spec['filters'] ?? [];
+        if (! is_array($filters) || $filters === []) {
+            return $spec;
+        }
+
+        $lookup = null;
+        $lookupIdx = null;
+        foreach ($filters as $i => $f) {
+            if (! is_array($f)) {
+                continue;
+            }
+            $field = $f['field'] ?? null;
+            $op = $f['op'] ?? '=';
+            $value = $f['value'] ?? null;
+            if (! is_string($field) || ! is_string($op) || $op !== '=' || ! is_string($value)) {
+                continue;
+            }
+
+            $fieldLower = strtolower($field);
+            if (in_array($fieldLower, ['user_name', 'owner', 'user'], true)) {
+                $lookup = trim($value);
+                $lookupIdx = $i;
+                break;
+            }
+
+            if ($fieldLower === 'user_id') {
+                $v = trim($value);
+                if ($v !== '' && ! ctype_digit($v)) {
+                    $lookup = $v;
+                    $lookupIdx = $i;
+                    break;
+                }
+            }
+        }
+
+        if ($lookup === null || $lookupIdx === null || $lookup === '') {
+            return $spec;
+        }
+
+        $user = User::query()
+            ->whereRaw('lower(name) = lower(?)', [$lookup])
+            ->orWhereRaw('lower(email) = lower(?)', [$lookup])
+            ->first(['id', 'name']);
+
+        if (! $user) {
+            return new AiQueryResult(
+                columns: [],
+                rows: [],
+                summary: "I couldn't find a user named or emailed \"{$lookup}\".",
+                debug: ['spec' => $spec],
+            );
+        }
+
+        $filters[$lookupIdx] = ['field' => 'user_id', 'op' => '=', 'value' => (int) $user->id];
+        $spec['filters'] = $filters;
+
+        // ONLY_FULL_GROUP_BY: selecting user_id with COUNT(*) and no GROUP BY is invalid; drop select.
+        if (($spec['group_by'] ?? []) === [] && ($spec['aggregates'] ?? []) !== [] && in_array('user_id', $spec['select'] ?? [], true)) {
+            $spec['select'] = [];
+        }
+
+        return $spec;
     }
 
     /**
