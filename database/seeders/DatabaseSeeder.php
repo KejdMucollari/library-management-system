@@ -35,12 +35,11 @@ class DatabaseSeeder extends Seeder
 
         $users = User::factory(4)->create();
 
-        // Four regular users, then admin — same order as $owners below.
+
         $owners = $users->push($admin)->values();
 
         $genreIds = Genre::query()->pluck('id');
 
-        // Uneven split (100 total) so admin AI can rank "most books" vs "fewest books" per user.
         $booksPerOwner = [42, 28, 15, 8, 7];
 
         foreach ($owners as $index => $owner) {

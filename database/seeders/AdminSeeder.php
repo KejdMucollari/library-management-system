@@ -9,7 +9,7 @@ use Illuminate\Support\Facades\Hash;
 class AdminSeeder extends Seeder
 {
     /**
-     * Default admin for production / Railway (safe to re-run).
+     * Default admin for production
      */
     public function run(): void
     {
