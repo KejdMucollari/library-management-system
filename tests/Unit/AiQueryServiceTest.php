@@ -392,6 +392,58 @@ class AiQueryServiceTest extends TestCase
         $this->assertSame('Result: 2', $result['summary']);
     }
 
+    public function test_admin_owner_lookup_accepts_single_token_name_like_testuser(): void
+    {
+        $admin = User::factory()->create(['is_admin' => true]);
+        $target = User::factory()->create(['name' => 'TestUser', 'is_admin' => false]);
+        Book::factory()->for($target)->count(7)->create();
+
+        $service = app(\App\Services\Ai\AiQueryService::class);
+        $spec = [
+            'type' => 'metric',
+            'scope' => 'all',
+            'from' => 'books',
+            'select' => [],
+            'aggregates' => [['fn' => 'count', 'field' => '*', 'as' => 'count']],
+            'group_by' => [],
+            'order_by' => [],
+            'limit' => 1,
+            'filters' => [
+                ['field' => 'user_id', 'op' => '=', 'value' => 'TestUser'],
+            ],
+        ];
+
+        $result = $service->execute($spec, $admin, 'how many books does TestUser have')->toArray();
+        $this->assertSame('Result: 7', $result['summary']);
+    }
+
+    public function test_admin_overrides_groq_guessed_numeric_user_id_using_question_name(): void
+    {
+        $admin = User::factory()->create(['is_admin' => true]);
+        $target = User::factory()->create(['name' => 'TestUser', 'is_admin' => false]);
+        Book::factory()->for($target)->count(7)->create();
+
+        $service = app(\App\Services\Ai\AiQueryService::class);
+
+        // Groq guessed the wrong numeric user id (e.g. 1).
+        $spec = [
+            'type' => 'metric',
+            'scope' => 'all',
+            'from' => 'books',
+            'select' => [],
+            'aggregates' => [['fn' => 'count', 'field' => '*', 'as' => 'count']],
+            'group_by' => [],
+            'order_by' => [],
+            'limit' => 1,
+            'filters' => [
+                ['field' => 'user_id', 'op' => '=', 'value' => 1],
+            ],
+        ];
+
+        $result = $service->execute($spec, $admin, 'how many books does TestUser have')->toArray();
+        $this->assertSame('Result: 7', $result['summary']);
+    }
+
     public function test_completion_rate_returns_summary_without_sql_error(): void
     {
         $user = User::factory()->create(['is_admin' => false]);
@@ -415,6 +467,126 @@ class AiQueryServiceTest extends TestCase
 
         $this->assertStringContainsString('completion rate', strtolower($result['summary'] ?? ''));
         $this->assertStringContainsString('4/10', (string) ($result['summary'] ?? ''));
+    }
+
+    public function test_genres_select_id_also_includes_name_for_readability(): void
+    {
+        $admin = User::factory()->create(['is_admin' => true]);
+        $g = Genre::factory()->create(['name' => 'Sci-Fi', 'slug' => 'sci-fi-'.uniqid()]);
+
+        $service = app(\App\Services\Ai\AiQueryService::class);
+        $spec = [
+            'type' => 'table',
+            'scope' => 'all',
+            'from' => 'genres',
+            'select' => ['id'],
+            'aggregates' => [],
+            'group_by' => [],
+            'order_by' => [],
+            'limit' => 1,
+            'filters' => [
+                ['field' => 'id', 'op' => '=', 'value' => $g->id],
+            ],
+        ];
+
+        $result = $service->execute($spec, $admin, 'genre by id')->toArray();
+        $this->assertCount(1, $result['rows']);
+        $this->assertSame('Sci-Fi', $result['rows'][0]['name']);
+    }
+
+    public function test_admin_favorite_genre_for_named_user_is_computed_server_side(): void
+    {
+        $admin = User::factory()->create(['is_admin' => true]);
+        $user = User::factory()->create(['name' => 'Kendra Swaniawski', 'is_admin' => false]);
+        $g1 = Genre::factory()->create(['name' => 'Fantasy', 'slug' => 'fantasy-'.uniqid()]);
+        $g2 = Genre::factory()->create(['name' => 'Sci-Fi', 'slug' => 'sci-fi-'.uniqid()]);
+
+        Book::factory()->for($user)->count(3)->create(['genre_id' => $g2->id]);
+        Book::factory()->for($user)->count(1)->create(['genre_id' => $g1->id]);
+
+        $service = app(\App\Services\Ai\AiQueryService::class);
+        $spec = [
+            'type' => 'metric',
+            'scope' => 'all',
+            'from' => 'users',
+            'select' => ['id'],
+            'aggregates' => [['fn' => 'avg', 'field' => 'id', 'as' => 'avg_id']],
+            'group_by' => ['name'],
+            'order_by' => [['field' => 'avg_id', 'dir' => 'desc']],
+            'limit' => 1,
+            'filters' => [
+                ['field' => 'name', 'op' => '=', 'value' => 'Kendra Swaniawski'],
+            ],
+        ];
+
+        $result = $service->execute($spec, $admin, 'what is Kendra Swaniawski favorite genre of books')->toArray();
+
+        $this->assertStringContainsString('favorite genre', strtolower($result['summary'] ?? ''));
+        $this->assertSame('Sci-Fi', $result['rows'][0]['genre']);
+        $this->assertSame(3, (int) $result['rows'][0]['count']);
+    }
+
+    public function test_admin_how_many_genre_books_for_named_user_overrides_groq_user_id(): void
+    {
+        $admin = User::factory()->create(['is_admin' => true]);
+        $user = User::factory()->create(['name' => 'Billie Lindgren', 'is_admin' => false]);
+        $history = Genre::factory()->create(['name' => 'History', 'slug' => 'history-'.uniqid()]);
+        $fantasy = Genre::factory()->create(['name' => 'Fantasy', 'slug' => 'fantasy-'.uniqid()]);
+
+        Book::factory()->for($user)->count(4)->create(['genre_id' => $history->id]);
+        Book::factory()->for($user)->count(2)->create(['genre_id' => $fantasy->id]);
+
+        $service = app(\App\Services\Ai\AiQueryService::class);
+
+        // Groq guessed wrong user_id=1 but genre filter is correct.
+        $spec = [
+            'type' => 'metric',
+            'scope' => 'all',
+            'from' => 'books',
+            'select' => [],
+            'aggregates' => [['fn' => 'count', 'field' => '*', 'as' => 'count']],
+            'group_by' => [],
+            'order_by' => [],
+            'limit' => null,
+            'filters' => [
+                ['field' => 'user_id', 'op' => '=', 'value' => 1],
+                ['field' => 'genre', 'op' => '=', 'value' => 'History'],
+            ],
+            'filter_or_groups' => [],
+        ];
+
+        $result = $service->execute($spec, $admin, 'how many history books does Billie Lindgren have')->toArray();
+        $this->assertSame('Result: 4', $result['summary']);
+    }
+
+    public function test_admin_group_by_genre_drops_user_id_select_to_avoid_only_full_group_by(): void
+    {
+        $admin = User::factory()->create(['is_admin' => true]);
+        $user = User::factory()->create(['name' => 'TestUser', 'is_admin' => false]);
+        $bio = Genre::factory()->create(['name' => 'Biography', 'slug' => 'bio-'.uniqid()]);
+
+        Book::factory()->for($user)->count(3)->create(['genre_id' => $bio->id]);
+
+        $service = app(\App\Services\Ai\AiQueryService::class);
+        $spec = [
+            'type' => 'table',
+            'scope' => 'all',
+            'from' => 'books',
+            'select' => ['user_id'],
+            'aggregates' => [['fn' => 'count', 'field' => '*', 'as' => 'count']],
+            'group_by' => ['genre'],
+            'order_by' => [['field' => 'count', 'dir' => 'desc']],
+            'limit' => 25,
+            'filters' => [
+                ['field' => 'genre', 'op' => '=', 'value' => 'Biography'],
+                ['field' => 'user_id', 'op' => '=', 'value' => (string) $user->id],
+            ],
+        ];
+
+        $result = $service->execute($spec, $admin, 'how many biography books does TestUser have')->toArray();
+        $this->assertSame(1, count($result['rows']));
+        $this->assertSame('Biography', $result['rows'][0]['genre']);
+        $this->assertSame(3, (int) $result['rows'][0]['count']);
     }
 }
 

@@ -387,6 +387,20 @@ class AiQueryService
             return true;
         }
 
+        // Cross-user ownership questions that mention a specific person by name.
+        // Examples: "how many books does TestUser have", "what books does Billie Lindgren have".
+        if (! preg_match('/\b(my|mine|i)\b/u', $q)) {
+            if (preg_match('/\bhow\s+many\s+books\s+does\s+.+\s+(have|own)\b/u', $q)) {
+                return true;
+            }
+            if (preg_match('/\bwhat\s+books\s+does\s+.+\s+have\b/u', $q)) {
+                return true;
+            }
+            if (preg_match('/\bshow\s+.+\s+books\b/u', $q) && preg_match('/\b(user|member|reader|person)\b/u', $q)) {
+                return true;
+            }
+        }
+
         return false;
     }
 
@@ -555,9 +569,37 @@ class AiQueryService
                     debug: ['spec' => $spec],
                 );
             }
+
+            // If the model tries to filter by another user's name inside user_id, block it (privacy + correctness).
+            if (($spec['from'] ?? null) === 'books' && isset($spec['filters']) && is_array($spec['filters'])) {
+                foreach ($spec['filters'] as $f) {
+                    if (! is_array($f)) {
+                        continue;
+                    }
+                    if (($f['field'] ?? null) === 'user_id' && ($f['op'] ?? '=') === '=' && is_string($f['value'] ?? null)) {
+                        $v = trim((string) $f['value']);
+                        if ($v !== '' && ! ctype_digit($v)) {
+                            return new AiQueryResult(
+                                columns: [],
+                                rows: [],
+                                summary: "I can only answer questions about your own books. I can't look up other users by name.",
+                                debug: ['spec' => $spec],
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         $spec = $this->validateAndNormalizeSpec($spec, $actor->isAdmin(), $question);
+
+        // Admin: "X's favorite genre" is deterministic; avoid Groq's common invalid users aggregates.
+        if ($actor->isAdmin() && $question !== null && $this->questionAsksUsersFavoriteGenre($question)) {
+            $res = $this->answerUsersFavoriteGenre($question);
+            if ($res !== null) {
+                return $res;
+            }
+        }
 
         // Completion rate needs two counts (completed / total); handle it directly.
         if (($spec['from'] ?? null) === 'books' && $question !== null && preg_match('/\bcompletion\s+rate\b/u', strtolower($question))) {
@@ -580,6 +622,14 @@ class AiQueryService
         // Admin can ask questions about books by specifying the owner's name/email.
         // Groq sometimes incorrectly places a user name into the user_id filter; normalize that to a real id.
         if ($actor->isAdmin() && ($spec['from'] ?? null) === 'books') {
+            // If the question explicitly names a user (e.g. "how many books does TestUser have"),
+            // override any Groq-guessed user_id with the real resolved user id.
+            $specOrEarly = $this->overrideOwnerFilterFromQuestionForAdmin($spec, $question);
+            if ($specOrEarly instanceof AiQueryResult) {
+                return $specOrEarly;
+            }
+            $spec = $specOrEarly;
+
             $specOrEarly = $this->resolveBookOwnerFiltersForAdmin($spec);
             if ($specOrEarly instanceof AiQueryResult) {
                 return $specOrEarly;
@@ -1062,6 +1112,19 @@ class AiQueryService
         $select = array_values(array_filter($select, 'is_string'));
         $groupBy = array_values(array_filter($groupBy, 'is_string'));
 
+        // UX: when querying genres, returning only a numeric id is not useful.
+        // If the spec selects id but not name, include name automatically.
+        if ($from === 'genres' && in_array('id', $select, true) && ! in_array('name', $select, true)) {
+            $select[] = 'name';
+        }
+
+        // MySQL ONLY_FULL_GROUP_BY: if we have aggregates AND a GROUP BY, any raw selected columns
+        // must be included in GROUP BY. Drop non-grouped raw selects (LLM often keeps user_id around),
+        // but always keep the grouped fields so result rows remain readable.
+        if ($aggregates !== [] && $groupBy !== []) {
+            $select = array_values(array_unique(array_merge(array_intersect($select, $groupBy), $groupBy)));
+        }
+
         $aggregatesNorm = [];
         foreach ($aggregates as $a) {
             if (! is_array($a)) {
@@ -1334,6 +1397,176 @@ class AiQueryService
     }
 
     /**
+     * Admin-only: If the natural-language question names a user, prefer that over Groq-guessed numeric ids.
+     *
+     * Examples:
+     * - "how many books does TestUser have"
+     * - "what books does Billie Lindgren have"
+     *
+     * @param  array<string, mixed>  $spec
+     * @return array<string, mixed>|AiQueryResult
+     */
+    private function overrideOwnerFilterFromQuestionForAdmin(array $spec, ?string $question): array|AiQueryResult
+    {
+        if (($spec['from'] ?? null) !== 'books' || $question === null || trim($question) === '') {
+            return $spec;
+        }
+
+        $lookup = $this->extractOwnerLookupFromQuestion($question);
+        if ($lookup === null) {
+            return $spec;
+        }
+
+        $user = $this->resolveUserFromLookup($lookup);
+        if ($user) {
+            $spec['filters'] = $this->upsertEqualsFilter($spec['filters'] ?? [], 'user_id', (int) $user->id);
+            return $spec;
+        }
+
+        // If not a user, but matches an author, treat it as an author filter.
+        $authorMatch = Book::query()
+            ->whereRaw('lower(author) = lower(?)', [$lookup])
+            ->exists();
+        if ($authorMatch) {
+            $spec['filters'] = $this->upsertEqualsFilter($spec['filters'] ?? [], 'author', $lookup);
+            return $spec;
+        }
+
+        return $spec;
+    }
+
+    private function extractOwnerLookupFromQuestion(string $question): ?string
+    {
+        $q = trim($question);
+
+        // how many books does X have/own
+        if (preg_match('/\bhow\s+many\s+books\s+does\s+(.+?)\s+(have|own)\b/iu', $q, $m)) {
+            return trim((string) $m[1]);
+        }
+
+        // how many <genre/descriptor> books does X have/own
+        // e.g. "how many history books does Billie Lindgren have"
+        if (preg_match('/\bhow\s+many\s+.+?\s+books\s+does\s+(.+?)\s+(have|own)\b/iu', $q, $m)) {
+            return trim((string) $m[1]);
+        }
+
+        // what books does X have
+        if (preg_match('/\bwhat\s+books\s+does\s+(.+?)\s+have\b/iu', $q, $m)) {
+            return trim((string) $m[1]);
+        }
+
+        // show X books
+        if (preg_match('/\bshow\s+(.+?)\s+books\b/iu', $q, $m)) {
+            return trim((string) $m[1]);
+        }
+
+        return null;
+    }
+
+    private function questionAsksUsersFavoriteGenre(string $question): bool
+    {
+        $q = strtolower(trim($question));
+        if ($q === '') {
+            return false;
+        }
+
+        return (bool) preg_match('/\b(favorite|favourite)\s+genre\b/u', $q);
+    }
+
+    /**
+     * Admin-only answer for "What is X's favorite genre".
+     */
+    private function answerUsersFavoriteGenre(string $question): ?AiQueryResult
+    {
+        $q = trim($question);
+        $name = null;
+
+        // "what is Kendra Swaniawski favorite genre ..."
+        if (preg_match('/\bwhat\s+is\s+(.+?)\s+(favorite|favourite)\s+genre\b/iu', $q, $m)) {
+            $name = trim((string) $m[1]);
+        }
+
+        // "Kendra Swaniawski's favorite genre ..."
+        if ($name === null && preg_match('/^(.+?)\s*\'s\s+(favorite|favourite)\s+genre\b/iu', $q, $m)) {
+            $name = trim((string) $m[1]);
+        }
+
+        if ($name === null || $name === '') {
+            return null;
+        }
+
+        $user = $this->resolveUserFromLookup($name);
+        if (! $user) {
+            return new AiQueryResult(
+                columns: [],
+                rows: [],
+                summary: "I couldn't find a user named \"{$name}\".",
+                debug: ['question' => $question],
+            );
+        }
+
+        $row = Book::query()
+            ->leftJoin('genres', 'genres.id', '=', 'books.genre_id')
+            ->where('books.user_id', $user->id)
+            ->whereNotNull('books.genre_id')
+            ->selectRaw('genres.name as genre, count(books.id) as count')
+            ->groupBy('genres.id', 'genres.name')
+            ->orderByDesc('count')
+            ->limit(1)
+            ->first();
+
+        if (! $row) {
+            return new AiQueryResult(
+                columns: [],
+                rows: [],
+                summary: "I couldn't determine {$user->name}'s favorite genre yet (no books with genres).",
+                debug: ['user_id' => $user->id],
+            );
+        }
+
+        $genre = (string) ($row->genre ?? '—');
+        $count = (int) ($row->count ?? 0);
+
+        return new AiQueryResult(
+            columns: ['genre', 'count'],
+            rows: [
+                ['genre' => $genre, 'count' => $count],
+            ],
+            summary: "{$user->name}'s favorite genre is {$genre} ({$count} book(s)).",
+            debug: ['user_id' => $user->id],
+        );
+    }
+
+    /**
+     * @param  mixed  $filters
+     * @return array<int, array{field: string, op: string, value: string|int|float}>
+     */
+    private function upsertEqualsFilter(mixed $filters, string $field, string|int|float $value): array
+    {
+        $out = [];
+        if (is_array($filters)) {
+            foreach ($filters as $f) {
+                if (! is_array($f) || ! isset($f['field'], $f['op'])) {
+                    continue;
+                }
+                if (($f['field'] ?? null) === $field && ($f['op'] ?? null) === '=') {
+                    // drop old one (we'll re-add)
+                    continue;
+                }
+                $out[] = [
+                    'field' => (string) $f['field'],
+                    'op' => (string) $f['op'],
+                    'value' => $f['value'] ?? '',
+                ];
+            }
+        }
+
+        $out[] = ['field' => $field, 'op' => '=', 'value' => $value];
+
+        return $out;
+    }
+
+    /**
      * Resolve "user_3", numeric ids, emails, exact names, or fuzzy full-name matches.
      */
     private function resolveUserFromLookup(string $lookup): ?User
@@ -1375,6 +1608,20 @@ class AiQueryService
             $matches = $q->limit(2)->get(['id', 'name', 'email']);
             if ($matches->count() === 1) {
                 return $matches->first();
+            }
+        }
+
+        // single-token fallback (e.g. "TestUser"): accept a unique partial match
+        if (count($tokens) === 1) {
+            $t = (string) $tokens[0];
+            if ($t !== '') {
+                $matches = User::query()
+                    ->whereRaw('lower(name) like ?', ['%'.$t.'%'])
+                    ->limit(2)
+                    ->get(['id', 'name', 'email']);
+                if ($matches->count() === 1) {
+                    return $matches->first();
+                }
             }
         }
 
