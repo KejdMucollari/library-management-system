@@ -1294,29 +1294,91 @@ class AiQueryService
             return $spec;
         }
 
-        $user = User::query()
-            ->whereRaw('lower(name) = lower(?)', [$lookup])
-            ->orWhereRaw('lower(email) = lower(?)', [$lookup])
-            ->first(['id', 'name']);
+        $user = $this->resolveUserFromLookup($lookup);
 
-        if (! $user) {
-            return new AiQueryResult(
-                columns: [],
-                rows: [],
-                summary: "I couldn't find a user named or emailed \"{$lookup}\".",
-                debug: ['spec' => $spec],
-            );
+        if ($user) {
+            $filters[$lookupIdx] = ['field' => 'user_id', 'op' => '=', 'value' => (int) $user->id];
+            $spec['filters'] = $filters;
+
+            // ONLY_FULL_GROUP_BY: selecting user_id with COUNT(*) and no GROUP BY is invalid; drop select.
+            if (($spec['group_by'] ?? []) === [] && ($spec['aggregates'] ?? []) !== [] && in_array('user_id', $spec['select'] ?? [], true)) {
+                $spec['select'] = [];
+            }
+
+            return $spec;
         }
 
-        $filters[$lookupIdx] = ['field' => 'user_id', 'op' => '=', 'value' => (int) $user->id];
-        $spec['filters'] = $filters;
+        // If no user matched but the lookup matches an author name, treat it as an author filter.
+        $authorMatch = Book::query()
+            ->whereRaw('lower(author) = lower(?)', [$lookup])
+            ->exists();
 
-        // ONLY_FULL_GROUP_BY: selecting user_id with COUNT(*) and no GROUP BY is invalid; drop select.
-        if (($spec['group_by'] ?? []) === [] && ($spec['aggregates'] ?? []) !== [] && in_array('user_id', $spec['select'] ?? [], true)) {
-            $spec['select'] = [];
+        if ($authorMatch) {
+            $filters[$lookupIdx] = ['field' => 'author', 'op' => '=', 'value' => $lookup];
+            $spec['filters'] = $filters;
+
+            // If this was an aggregate metric, selecting user_id is meaningless; drop it.
+            if (($spec['group_by'] ?? []) === [] && ($spec['aggregates'] ?? []) !== [] && in_array('user_id', $spec['select'] ?? [], true)) {
+                $spec['select'] = [];
+            }
+
+            return $spec;
         }
 
-        return $spec;
+        return new AiQueryResult(
+            columns: [],
+            rows: [],
+            summary: "I couldn't find a user named \"{$lookup}\" (or an author with that exact name). Try using a user id like \"user_3\" or the user's email.",
+            debug: ['spec' => $spec],
+        );
+    }
+
+    /**
+     * Resolve "user_3", numeric ids, emails, exact names, or fuzzy full-name matches.
+     */
+    private function resolveUserFromLookup(string $lookup): ?User
+    {
+        $raw = trim($lookup);
+        if ($raw === '') {
+            return null;
+        }
+
+        // user_3 / user-3 / user 3
+        if (preg_match('/\buser[\s_\-]*(\d+)\b/i', $raw, $m)) {
+            $id = (int) $m[1];
+            return User::query()->whereKey($id)->first(['id', 'name', 'email']);
+        }
+
+        // plain numeric id
+        if (ctype_digit($raw)) {
+            $id = (int) $raw;
+            return User::query()->whereKey($id)->first(['id', 'name', 'email']);
+        }
+
+        // exact email or exact name (case-insensitive)
+        $u = User::query()
+            ->whereRaw('lower(email) = lower(?)', [$raw])
+            ->orWhereRaw('lower(name) = lower(?)', [$raw])
+            ->first(['id', 'name', 'email']);
+        if ($u) {
+            return $u;
+        }
+
+        // fuzzy name match: all tokens must appear in name (case-insensitive)
+        $tokens = preg_split('/\s+/', strtolower(preg_replace('/[^\p{L}\p{N}\s]+/u', ' ', $raw)));
+        $tokens = array_values(array_filter($tokens, fn ($t) => is_string($t) && $t !== ''));
+        if (count($tokens) >= 2) {
+            $q = User::query();
+            foreach ($tokens as $t) {
+                $q->whereRaw('lower(name) like ?', ['%'.$t.'%']);
+            }
+            $matches = $q->limit(2)->get(['id', 'name', 'email']);
+            if ($matches->count() === 1) {
+                return $matches->first();
+            }
+        }
+
+        return null;
     }
 
     /**

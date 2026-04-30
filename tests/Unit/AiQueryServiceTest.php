@@ -341,6 +341,57 @@ class AiQueryServiceTest extends TestCase
         $this->assertSame('Result: 3', $result['summary']);
     }
 
+    public function test_admin_owner_lookup_accepts_user_3_alias(): void
+    {
+        $admin = User::factory()->create(['is_admin' => true]);
+        $target = User::factory()->create(['name' => 'Billie Lindgren', 'is_admin' => false]);
+        Book::factory()->for($target)->count(2)->create();
+
+        $service = app(AiQueryService::class);
+        $spec = [
+            'type' => 'metric',
+            'scope' => 'all',
+            'from' => 'books',
+            'select' => [],
+            'aggregates' => [['fn' => 'count', 'field' => '*', 'as' => 'count']],
+            'group_by' => [],
+            'order_by' => [],
+            'limit' => 1,
+            'filters' => [
+                ['field' => 'user_id', 'op' => '=', 'value' => 'user_'.$target->id],
+            ],
+        ];
+
+        $result = $service->execute($spec, $admin, 'how many books does user_'.$target->id.' have')->toArray();
+        $this->assertSame('Result: 2', $result['summary']);
+    }
+
+    public function test_admin_owner_lookup_falls_back_to_author_when_user_not_found(): void
+    {
+        $admin = User::factory()->create(['is_admin' => true]);
+        $u = User::factory()->create(['is_admin' => false]);
+        Book::factory()->for($u)->count(2)->create(['author' => 'Mr. Neil Upton Jr']);
+
+        $service = app(AiQueryService::class);
+        $spec = [
+            'type' => 'metric',
+            'scope' => 'all',
+            'from' => 'books',
+            'select' => [],
+            'aggregates' => [['fn' => 'count', 'field' => '*', 'as' => 'count']],
+            'group_by' => [],
+            'order_by' => [],
+            'limit' => 1,
+            'filters' => [
+                // model bug: user_id equals a name that is actually an author
+                ['field' => 'user_id', 'op' => '=', 'value' => 'Mr. Neil Upton Jr'],
+            ],
+        ];
+
+        $result = $service->execute($spec, $admin, 'how many books does Mr. Neil Upton Jr have')->toArray();
+        $this->assertSame('Result: 2', $result['summary']);
+    }
+
     public function test_completion_rate_returns_summary_without_sql_error(): void
     {
         $user = User::factory()->create(['is_admin' => false]);
